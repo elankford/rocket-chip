@@ -1,89 +1,163 @@
-class SweepUnit(params: SweepUnitParams) extends Module {
+import chisel3._
+import chisel3.util._
+import freechips.rocketchip.tile._
+import freechips.rocketchip.tilelink._
+import freechips.rocketchip.config.Parameters
+
+class Sweeper(implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
-    val start = Input(Bool())
-    val done = Output(Bool())
-    val mem = new MemoryInterface // REDEFINE THIS
+    val blockAddr = Input(UInt(64.W))      // 64-bit virtual address of the block to sweep
+    val blockPtrReady = Input(Bool())      // Valid signal from wrapper indicating a block is ready
+    val sweeperReady = Output(Bool())      // Indicates completion of the sweeping process
+    val mem = new HellaCacheIO             // TileLink memory interface
   })
 
-  // sweep logic
-}
+  // Define FSM states
+  val idle :: translateAddr :: loadMetadata :: loadFreeListHead :: loadCellHeader1 :: loadCellHeader2 :: updateFreeList :: writeBackHeaders :: done :: Nil = Enum(9)
+  val state = RegInit(idle)
 
-class SweepRoCC(opcodes: OpcodeSet) extends RoCC(opcodes) {
-  val sweepUnit = Module(new SweepUnit(params))
+  // Registers for internal use
+  val blockPAddr = Reg(UInt(64.W))         // Physical address of the block
+  val cellSize = Reg(UInt(32.W))           // Size of each cell
+  val numCells = Reg(UInt(32.W))           // Number of cells in the block
+  val freeListHead = Reg(UInt(64.W))       // Free list head
+  val currentCell = Reg(UInt(64.W))        // Current cell address being processed
+  val currentHeader1 = Reg(UInt(64.W))     // First 64-bit header word of a cell
+  val currentHeader2 = Reg(UInt(64.W))     // Second 64-bit header word of a cell
+  val cellCount = Reg(UInt(32.W))          // Counter to track processed cells
+  val markBitMask = 1.U                    // Mark bit mask
+  val tagBitMask = 2.U                     // Tag bit mask
+  val flBitMask = 4.U                      // Free list bit (FL) mask
+  val newHeader1 = Wire(UInt(64.W))
+  val newHeader2 = Wire(UInt(64.W))
 
-  // Connect RoCC instructions to control the sweep unit
-  when(io.cmd.valid) {
-    sweepUnit.io.start := true.B
-  }
+  // Default outputs
+  io.sweeperReady := false.B
 
-  io.resp.valid := sweepUnit.io.done
-}
+  // Memory and TLB settings for TileLink
+  io.mem.req.valid := false.B
+  io.mem.req.bits.cmd := M_XRD // Default read command
+  io.mem.req.bits.size := log2Ceil(8).U // 64-bit accesses
 
+  // Initialize TLB
+  val tlb = Module(new TLB(instruction = false, lgMaxSize = log2Ceil(8), nEntries = 32))
+  tlb.io.req.valid := false.B
+  tlb.io.req.bits.vaddr := io.blockAddr
+  tlb.io.req.bits.size := log2Ceil(8).U
+  tlb.io.req.bits.cmd := M_XRD
 
-class MemoryInterface extends Bundle {
-  val addr = Output(UInt(64.W))
-  val dataIn = Input(UInt(64.W))
-  val dataOut = Output(UInt(64.W))
-  val read = Output(Bool())
-  val write = Output(Bool())
-  val ready = Input(Bool())
-}
+  switch(state) {
+    is(idle) {
+      io.sweeperReady := true.B
+      when(io.blockPtrReady) {
+        state := translateAddr
+      }
+    }
 
+    is(translateAddr) {
+      tlb.io.req.valid := true.B
+      tlb.io.req.bits.vaddr := io.blockAddr
+      when(tlb.io.resp.valid) {
+        blockPAddr := tlb.io.resp.bits.paddr
+        state := loadMetadata
+      }
+    }
 
-val sIdle :: sRead :: sProcess :: sWrite :: sDone :: Nil = Enum(5)
-val state = RegInit(sIdle)
+    is(loadMetadata) {
+      // Load metadata: 64-bit word at the block's physical address
+      io.mem.req.valid := true.B
+      io.mem.req.bits.addr := blockPAddr
+      io.mem.req.bits.cmd := M_XRD
+      when(io.mem.resp.valid) {
+        val metadata = io.mem.resp.bits.data
+        cellSize := metadata(63, 32) // Extract cell size
+        numCells := metadata(31, 0)  // Extract number of cells
+        state := loadFreeListHead
+      }
+    }
 
-switch(state) {
-  is(sIdle) {
-    when(io.start) {
-      state := sRead
+    is(loadFreeListHead) {
+      // Load the free list head (next 64 bits)
+      io.mem.req.valid := true.B
+      io.mem.req.bits.addr := blockPAddr + 8.U
+      io.mem.req.bits.cmd := M_XRD
+      when(io.mem.resp.valid) {
+        freeListHead := io.mem.resp.bits.data
+        cellCount := 0.U
+        currentCell := blockPAddr + 128.U // Start processing cells at 128-bit offset
+        state := loadCellHeader1
+      }
+    }
+
+    is(loadCellHeader1) {
+      // Load the first 64 bits of the current cell's header
+      io.mem.req.valid := true.B
+      io.mem.req.bits.addr := currentCell
+      io.mem.req.bits.cmd := M_XRD
+      when(io.mem.resp.valid) {
+        currentHeader1 := io.mem.resp.bits.data
+        state := loadCellHeader2
+      }
+    }
+
+    is(loadCellHeader2) {
+      // Load the second 64 bits of the current cell's header
+      io.mem.req.valid := true.B
+      io.mem.req.bits.addr := currentCell + 8.U
+      io.mem.req.bits.cmd := M_XRD
+      when(io.mem.resp.valid) {
+        currentHeader2 := io.mem.resp.bits.data
+        state := updateFreeList
+      }
+    }
+
+    is(updateFreeList) {
+      // Examine mark, tag, and FL bits and update headers as needed
+      val markBit = currentHeader1 & markBitMask
+      val tagBit = (currentHeader1 & tagBitMask) >> 1
+      val flBit = (currentHeader1 & flBitMask) >> 2
+
+      // Clear the mark bit
+      newHeader1 := currentHeader1 & ~markBitMask
+
+      // If mark is 0, tag is 1, FL is 0, then update the FL bit and header2's FLNext pointer
+      when(markBit === 0.U && tagBit === 1.U && flBit === 0.U) {
+        newHeader1 := newHeader1 | flBitMask
+        newHeader2 := Cat(freeListHead(31, 0), currentHeader2(63, 32)) // Set FLNext to previous freeListHead
+        freeListHead := currentCell // Update free list head
+      }.otherwise {
+        newHeader2 := currentHeader2
+      }
+      state := writeBackHeaders
+    }
+
+    is(writeBackHeaders) {
+      // Write updated headers back to memory
+      io.mem.req.valid := true.B
+      io.mem.req.bits.addr := currentCell
+      io.mem.req.bits.cmd := M_XWR
+      io.mem.req.bits.data := newHeader1
+      when(io.mem.resp.valid) {
+        // Write second header word
+        io.mem.req.valid := true.B
+        io.mem.req.bits.addr := currentCell + 8.U
+        io.mem.req.bits.data := newHeader2
+        when(io.mem.resp.valid) {
+          // Check if all cells processed
+          cellCount := cellCount + 1.U
+          when(cellCount === numCells) {
+            state := done
+          }.otherwise {
+            currentCell := currentCell + cellSize
+            state := loadCellHeader1
+          }
+        }
+      }
+    }
+
+    is(done) {
+      io.sweeperReady := true.B
+      state := idle
     }
   }
-  is(sRead) {
-    // Initiate memory read
-    state := sProcess
-  }
-  is(sProcess) {
-    // Check if the object is marked
-    // Decide whether to free or skip
-    state := sWrite
-  }
-  is(sWrite) {
-    // Write back if necessary
-    state := sRead // Or sDone if at the end
-  }
-  is(sDone) {
-    io.done := true.B
-    state := sIdle
-  }
 }
-
-
-val markBitmap = SyncReadMem(markBitmapSize, Bool())
-
-// Read mark bit
-val markBit = markBitmap.read(currentAddr)
-
-// Write mark bit (if needed)
-when(writeMarkBit) {
-  markBitmap.write(currentAddr, newMarkValue)
-}
-
-val freeList = Module(new FreeListManager())
-
-when(!markBit) {
-  freeList.io.addFreeBlock(currentAddr)
-}
-
-val currentAddr = RegInit(startAddr)
-
-when(state === sRead && io.mem.ready) {
-  io.mem.addr := currentAddr
-  io.mem.read := true.B
-}
-
-when(state === sProcess) {
-  // Process the data
-  currentAddr := currentAddr + objectSize
-}
-
