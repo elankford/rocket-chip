@@ -1,8 +1,9 @@
+package rocket
+
+import chipsalliance.rocketchip.config.Parameters
 import chisel3._
 import chisel3.util._
-import freechips.rocketchip.tile._
-import freechips.rocketchip.tilelink._
-import freechips.rocketchip.config.Parameters
+import freechips.rocketchip.rocket.{HellaCacheIO, M_XRD, M_XWR, TLB}
 
 class Sweeper(implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
@@ -55,12 +56,15 @@ class Sweeper(implicit p: Parameters) extends Module {
     }
 
     is(translateAddr) {
+      io.sweeperReady := false.B
       tlb.io.req.valid := true.B
       tlb.io.req.bits.vaddr := io.blockAddr
+    when(tlb.io.req.ready){
       when(tlb.io.resp.valid) {
         blockPAddr := tlb.io.resp.bits.paddr
         state := loadMetadata
       }
+    }
     }
 
     is(loadMetadata) {
@@ -68,11 +72,14 @@ class Sweeper(implicit p: Parameters) extends Module {
       io.mem.req.valid := true.B
       io.mem.req.bits.addr := blockPAddr
       io.mem.req.bits.cmd := M_XRD
-      when(io.mem.resp.valid) {
-        val metadata = io.mem.resp.bits.data
-        cellSize := metadata(63, 32) // Extract cell size
-        numCells := metadata(31, 0)  // Extract number of cells
-        state := loadFreeListHead
+      when(io.mem.req.ready) {       
+        when(io.mem.resp.valid) {
+            io.mem.req.valid := false.B
+            val metadata = io.mem.resp.bits.data
+            cellSize := metadata(63, 32) // Extract cell size
+            numCells := metadata(31, 0)  // Extract number of cells
+            state := loadFreeListHead
+        }
       }
     }
 
@@ -81,11 +88,14 @@ class Sweeper(implicit p: Parameters) extends Module {
       io.mem.req.valid := true.B
       io.mem.req.bits.addr := blockPAddr + 8.U
       io.mem.req.bits.cmd := M_XRD
-      when(io.mem.resp.valid) {
-        freeListHead := io.mem.resp.bits.data
-        cellCount := 0.U
-        currentCell := blockPAddr + 128.U // Start processing cells at 128-bit offset
-        state := loadCellHeader1
+      when(io.mem.req.ready) {       
+        when(io.mem.resp.valid) {
+            io.mem.req.valid := false.B
+            freeListHead := io.mem.resp.bits.data
+            cellCount := 0.U
+            currentCell := blockPAddr + 16.U // Start processing cells at 128-bit offset
+            state := loadCellHeader1
+        }
       }
     }
 
@@ -94,9 +104,12 @@ class Sweeper(implicit p: Parameters) extends Module {
       io.mem.req.valid := true.B
       io.mem.req.bits.addr := currentCell
       io.mem.req.bits.cmd := M_XRD
-      when(io.mem.resp.valid) {
-        currentHeader1 := io.mem.resp.bits.data
-        state := loadCellHeader2
+      when(io.mem.req.ready) {       
+        when(io.mem.resp.valid) {
+           io.mem.req.valid := false.B
+            currentHeader1 := io.mem.resp.bits.data
+            state := loadCellHeader2
+        }
       }
     }
 
@@ -105,9 +118,12 @@ class Sweeper(implicit p: Parameters) extends Module {
       io.mem.req.valid := true.B
       io.mem.req.bits.addr := currentCell + 8.U
       io.mem.req.bits.cmd := M_XRD
-      when(io.mem.resp.valid) {
-        currentHeader2 := io.mem.resp.bits.data
-        state := updateFreeList
+      when(io.mem.req.ready) {       
+        when(io.mem.resp.valid) {
+            io.mem.req.valid := false.B
+            currentHeader2 := io.mem.resp.bits.data
+            state := updateFreeList
+        }
       }
     }
 
@@ -137,20 +153,25 @@ class Sweeper(implicit p: Parameters) extends Module {
       io.mem.req.bits.addr := currentCell
       io.mem.req.bits.cmd := M_XWR
       io.mem.req.bits.data := newHeader1
-      when(io.mem.resp.valid) {
-        // Write second header word
-        io.mem.req.valid := true.B
-        io.mem.req.bits.addr := currentCell + 8.U
-        io.mem.req.bits.data := newHeader2
+      when(io.mem.req.ready) {       
         when(io.mem.resp.valid) {
-          // Check if all cells processed
-          cellCount := cellCount + 1.U
-          when(cellCount === numCells) {
-            state := done
-          }.otherwise {
-            currentCell := currentCell + cellSize
-            state := loadCellHeader1
-          }
+            // Write second header word
+            io.mem.req.valid := true.B
+            io.mem.req.bits.addr := currentCell + 8.U
+            io.mem.req.bits.data := newHeader2
+            when(io.mem.req.ready) {  
+              when(io.mem.resp.valid) {
+                io.mem.req.valid := false.B
+                // Check if all cells processed
+                cellCount := cellCount + 1.U
+                when(cellCount === numCells) {
+                    state := done
+                }.otherwise {
+                    currentCell := currentCell + cellSize
+                    state := loadCellHeader1
+                }
+              }
+            }
         }
       }
     }

@@ -1,9 +1,9 @@
+package rocket
+
+import chipsalliance.rocketchip.config.Parameters
 import chisel3._
 import chisel3.util._
 import freechips.rocketchip.rocket._
-import freechips.rocketchip.tile._
-import freechips.rocketchip.tilelink._
-import freechips.rocketchip.config.Parameters
 
 class TracerIO(implicit p: Parameters) extends Bundle {
   val tracerQueueVAddrIn = Input(UInt(64.W))     // Virtual address from tracer queue
@@ -49,23 +49,28 @@ class Tracer(implicit p: Parameters) extends Module {
 
   switch(state) {
     is(idle) {
-      io.tracerReadyForNext := true.B            // Signal ready for next address
-      io.toBeMarked := false.B                    // Default: no address to be marked
+      io.toBeMarked := false.B
+      io.tracerReadyForNext := true.B            // Signal ready for next address               
       when(io.tracerQueueDataReady) {
         currentVAddr := io.tracerQueueVAddrIn    // Capture incoming virtual address
         state := translateAddress
-        io.tracerReadyForNext := false.B
+        
       }
     }
 
     is(translateAddress) {
+      io.tracerReadyForNext := false.B
       tlb.io.req.valid := true.B                 // Initiate address translation
-      when(tlb.io.resp.valid) {                  // Wait for valid TLB response
-        currentPAddr := tlb.io.resp.bits.paddr   // Capture translated physical address
-        state := requestMemRead
+      tlb.io.req.bits.vaddr := currentVAddr          // Input virtual address
+      when(tlb.io.req.ready){
+        when(tlb.io.resp.valid) {                  // Wait for valid TLB response
+          tlb.io.req.valid := false.B
+          currentPAddr := tlb.io.resp.bits.paddr   // Capture translated physical address
+          state := requestMemRead
+        }
       }
     }
-
+    
     is(requestMemRead) {
       // Initiate memory read using TileLink
       io.mem.req.valid := true.B
@@ -78,15 +83,19 @@ class Tracer(implicit p: Parameters) extends Module {
     is(waitMemRead) {
       // Wait for memory read data to return
       when(io.mem.resp.valid) {
+        io.mem.req.valid := false.B
         memDataReg := io.mem.resp.bits.data      // Store data read from memory
         state := checkMarkBit
       }
     }
 
     is(checkMarkBit) {
-        io.toBeMarked := ~memDataReg(0)      // Check if mark bit is set
-        io.toBeMarkedData := currentVAddr    
-        state := idle
+      when(~memDataReg(0)) {                     // If mark bit (LSB) is 0, mark the address
+          io.toBeMarked := true.B
+          io.toBeMarkedData := currentVAddr        // Output virtual address for marking
+      }
+      io.tracerReadyForNext := true.B            // Ready for next address
+      state := idle                              // Return to idle state
     }
   }
 }

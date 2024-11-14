@@ -1,270 +1,160 @@
-// import chisel3._
-// import chisel3.util._
-// import freechips.rocketchip.tilelink._
-// import freechips.rocketchip.rocket._
-// import freechips.rocketchip.config.Parameters
-// import freechips.rocketchip.util._
+package rocket
 
-// // Marker module in Chisel
-// class Marker(implicit p: Parameters) extends Module {
-//   val io = IO(new Bundle {
-//     val markQueueVAddrIn = Input(UInt(64.W))  // 64-bit virtual address from mark queue
-//     val markQueueValidIn = Input(Bool())      // Valid signal from mark queue
-//     val outboundRefAddrOut = Output(UInt(64.W)) // Outbound reference physical address
-//     val outputDoneProcessing = Output(Bool())   
-//     val outputRefReady = Output(Bool())    // Signal that a reference address is ready
-//     val tlb = new TLBIO()                     // TLB IO for address translation
-//     val mem = new HellaCacheIO                 // TileLink memory interface
-//   })
-
-//   // Define state machine states
-//   val idle :: translateAddr :: loadStatusWord :: setMarkBit :: loadNumRefs :: processRefs :: outputRef :: waitRefOffset :: loadRefOffset :: Nil = Enum(9)
-//   val state = RegInit(idle)
-
-//   // Internal registers
-//   val objVAddr = RegInit(0.U(64.W))          // Object virtual address
-//   val objPAddr = RegInit(0.U(64.W))          // Object physical address
-//   val statusWord = RegInit(0.U(64.W))        // Header status word from memory
-//   val tibVAddr = RegInit(0.U(64.W))          // TIB virtual address
-//   val tibPAddr = RegInit(0.U(64.W))          // TIB physical address
-//   val numRefs = RegInit(0.U(64.W))           // Number of outbound references
-//   val refOffsetsAddr = RegInit(0.U(64.W))    // Address of the reference offsets
-//   val refCounter = RegInit(0.U(32.W))        // Reference counter
-//   val objBasePAddr = RegInit(0.U(64.W))      // Base physical address of the object
-//   val refOffset = RegInit(0.U(64.W))         // Offset of the reference
-//   val refAddr = RegInit(0.U(64.W))           // Physical address of the reference
-
-//   // Output control
-//   io.outboundRefAddrOut := refAddr
-//   io.outputRefReady := false.B
-
-//   // Memory and TLB control signals
-//   io.mem.req.valid := false.B
-//   io.mem.req.bits.cmd := M_XRD // Default read command, will be adjusted as necessary
-//   io.mem.req.bits.size := log2Ceil(8).U // 64-bit accesses
-//   io.mem.req.bits.addr := objPAddr
-
-//   // State machine
-//   switch(state) {
-//     is(idle) {
-//       io.outputDoneProcessing := true.B
-//       io.outputRefReady := false.B
-//       when(io.markQueueValidIn) {
-//         objVAddr := io.markQueueVAddrIn
-//         state := translateAddr
-//         io.outputDoneProcessing := false.B
-//       }
-//     }
-
-//     is(translateAddr) {
-//       // Request address translation via TLB
-//       io.tlb.req.valid := true.B
-//       io.tlb.req.bits.vaddr := objVAddr
-//       io.tlb.req.bits.size := log2Ceil(8).U
-//       when(io.tlb.resp.valid) {
-//         objPAddr := io.tlb.resp.bits.paddr
-//         state := loadStatusWord
-//       }
-//     }
-
-//     is(loadStatusWord) {
-//       // Load status word from object physical address
-//       io.mem.req.valid := true.B
-//       io.mem.req.bits.addr := objPAddr
-//       io.mem.req.bits.cmd := M_XRD
-//       when(io.mem.resp.valid) {
-//         statusWord := io.mem.resp.bits.data
-//         state := setMarkBit
-//       }
-//     }
-
-//     is(setMarkBit) {
-//       // Set the mark bit (LSB of status word) and write back
-//       statusWord := statusWord | 1.U
-//       io.mem.req.valid := true.B
-//       io.mem.req.bits.addr := objPAddr
-//       io.mem.req.bits.cmd := M_XWR
-//       io.mem.req.bits.data := statusWord
-//       when(io.mem.resp.valid) {
-//         // Translate TIB virtual address to physical address
-//         tibVAddr := Cat(statusWord(63, 32), 0.U(32.W)) // 32 LSBs as TIB address
-//         state := loadNumRefs
-//       }
-//     }
-
-//     is(loadNumRefs) {
-//       // Translate TIB address
-//       io.tlb.req.valid := true.B
-//       io.tlb.req.bits.vaddr := tibVAddr
-//       when(io.tlb.resp.valid) {
-//         tibPAddr := io.tlb.resp.bits.paddr
-//         state := loadNumRefs
-//       }
-//       // Load number of outbound references
-//       io.mem.req.valid := true.B
-//       io.mem.req.bits.addr := tibPAddr
-//       io.mem.req.bits.cmd := M_XRD
-//       when(io.mem.resp.valid) {
-//         numRefs := io.mem.resp.bits.data
-//         refOffsetsAddr := tibPAddr + 8.U
-//         objBasePAddr := objPAddr
-//         refCounter := 0.U
-//         state := processRefs
-//       }
-//     }
-
-//     is(processRefs) {
-//       // Check if there are references left to process
-//       when(refCounter < numRefs) {
-//         state := loadRefOffset
-//       }.otherwise {
-//         state := idle
-//       }
-//     }
-
-//     is(loadRefOffset) {
-//       // Load reference offset from memory
-//       io.mem.req.valid := true.B
-//       io.mem.req.bits.addr := refOffsetsAddr
-//       io.mem.req.bits.cmd := M_XRD
-//       when(io.mem.resp.valid) {
-//         refOffset := io.mem.resp.bits.data
-//         refOffsetsAddr := refOffsetsAddr + 8.U
-//         state := outputRef
-//       }
-//     }
-
-//     is(outputRef) {
-//       // Calculate and output reference address
-//       refAddr := objBasePAddr + refOffset
-//       io.outboundRefAddrOut := refAddr
-//       io.outputRefReady := true.B
-//       refCounter := refCounter + 1.U
-//       state := waitRefOffset
-//     }
-
-//     is(waitRefOffset) {
-//       // Deassert output signal after one cycle
-//       io.outputRefReady := false.B
-//       state := processRefs
-//     }
-//   }
-// }
-
-
+import chipsalliance.rocketchip.config.Parameters
+import chisel3._
+import chisel3.util._
+import freechips.rocketchip.rocket.{HellaCacheIO, M_XRD, TLB}
 
 class Marker(implicit p: Parameters) extends Module {
   val io = IO(new Bundle {
-    val markQueueVAddrIn = Input(UInt(64.W))  // 64-bit virtual address from mark queue
-    val markQueueValidIn = Input(Bool())      // Valid signal from mark queue
-    val outboundRefAddrOut = Output(UInt(64.W)) // Outbound reference physical address
-    val outputDoneProcessing = Output(Bool())   
-    val outputRefReady = Output(Bool())    // Signal that a reference address is ready
-    val mem = new HellaCacheIO                 // TileLink memory interface
+    val markQueueVAddrIn = Input(UInt(64.W))  // Input virtual address from mark queue
+    val markQueueValidIn = Input(Bool())      // Valid signal indicating data in mark queue
+    val outboundRefAddrOut = Output(UInt(64.W)) // Output reference physical address for tracing
+    val outputDoneProcessing = Output(Bool())   // Output indicating the marker is idle
+    val outputRefReady = Output(Bool())    // Output signaling that a reference address is ready
+    val mem = new HellaCacheIO                 // TileLink memory interface for memory access
   })
 
-  // Define state machine states
+  // Define state machine states for handling memory operations and address translations
   val idle :: translateAddr :: loadStatusWord :: setMarkBit :: loadNumRefs :: processRefs :: outputRef :: waitRefOffset :: loadRefOffset :: Nil = Enum(9)
   val state = RegInit(idle)
 
-  // Internal Registers
-  val objVAddr = Reg(UInt(64.W))             // Object virtual address
-  val objPAddr = Reg(UInt(64.W))             // Object physical address
-  val statusWord = Reg(UInt(64.W))           // Status word
-  val tibVAddr = Reg(UInt(64.W))             // TIB virtual address
-  val numRefs = Reg(UInt(64.W))              // Number of references
-  val refCounter = Reg(UInt(32.W))           // Reference counter
-  val refOffsetsAddr = Reg(UInt(64.W))       // Reference offsets address
-  val refAddr = Reg(UInt(64.W))              // Reference address
+  // Internal Registers to store intermediate data
+  val objVAddr = Reg(UInt(64.W))             // Holds the virtual address of the current object
+  val objPAddr = Reg(UInt(64.W))             // Physical address of the current object (after translation)
+  val statusWord = Reg(UInt(64.W))           // Stores the status word loaded from memory
+  val tibVAddr = Reg(UInt(64.W))             // Virtual address for TIB 
+  val numRefs = Reg(UInt(64.W))              // Number of outbound references from this object
+  val refCounter = Reg(UInt(32.W))           // Counter for tracking processed references
+  val refOffsetsAddr = Reg(UInt(64.W))       // Address of reference offsets within TIB
+  val refAddr = Reg(UInt(64.W))              // Computed address of each reference
+  val doneWithAddress = RegInit(false.B)
 
-  // Outputs Defaults
-  io.outboundRefAddrOut := refAddr
-  io.outputDoneProcessing := false.B
-  io.outputRefReady := false.B
+  // Default output values
+  io.outboundRefAddrOut := refAddr          // Outbound reference address for other modules
+  io.outputDoneProcessing := doneWithAddress     // Indicates when processing is completed
 
-  // Memory and TLB control signals
-  io.mem.req.valid := false.B
-  io.mem.req.bits.cmd := M_XRD // Default read command, will be adjusted as necessary
-  io.mem.req.bits.size := log2Ceil(8).U // 64-bit accesses
-  io.mem.req.bits.addr := objPAddr
+  
+  io.outputRefReady := false.B              // Signal that outbound reference address is ready
 
-  val tlb = Module(new TLB(instruction = false, lgMaxSize = log2Ceil(8), nEntries = 32))
-  tlb.io.req.valid := false.B
-  tlb.io.req.bits.vaddr := objVAddr
-  tlb.io.req.bits.size := log2Ceil(8).U
-  tlb.io.req.bits.cmd := M_XRD
 
+  // Memory control signals, initially set for reads
+  io.mem.req.valid := false.B               // Memory request is inactive by default
+  io.mem.req.bits.cmd := M_XRD              // Default command is read; adjusted as necessary
+  io.mem.req.bits.size := log2Ceil(8).U     // Size of access (8 bytes for 64-bit)
+
+  // Instantiate TLB module for address translation
+  val tlb = Module(new TLB(instruction = false, lgMaxSize = log2Ceil(8)))
+  tlb.io.req.valid := false.B               // TLB request signal inactive by default
+  tlb.io.req.bits.size := log2Ceil(8).U     // Access size (64 bits)
+  tlb.io.req.bits.cmd := M_XRD              // Read command for TLB
+
+  // FSM to control the marker's actions based on state
   switch(state) {
     is(idle) {
-      io.outputDoneProcessing := true.B
-      when(io.markQueueValidIn) {
-        objVAddr := io.markQueueVAddrIn
-        state := translateAddr
-        io.outputDoneProcessing := false.B
+      // IDLE state: Wait for a valid input from the mark queue
+      doneWithAddress := true.B       // Indicate idle state
+      when(io.markQueueValidIn) {             // Check if mark queue has valid data
+        objVAddr := io.markQueueVAddrIn       // Store input virtual address
+        state := translateAddr                // Move to address translation state
+        doneWithAddress := false.B    // Clear idle flag
       }
     }
+
     is(translateAddr) {
-      tlb.io.req.valid := true.B
-      tlb.io.req.bits.vaddr := objVAddr
-      when(tlb.io.resp.valid) {
-        objPAddr := tlb.io.resp.bits.paddr
-        state := loadStatusWord
-      }
-    }
-    is(loadStatusWord) {
-      io.mem.req.valid := true.B
-      io.mem.req.bits.addr := objPAddr
-      io.mem.req.bits.cmd := M_XRD
-      when(io.mem.resp.valid) {
-        statusWord := io.mem.resp.bits.data
-        state := setMarkBit
-      }
-    }
-    is(setMarkBit) {
-      statusWord := statusWord | 1.U
-      io.mem.req.valid := true.B
-      io.mem.req.bits.addr := objPAddr
-      io.mem.req.bits.cmd := M_XWR
-      io.mem.req.bits.data := statusWord
-      when(io.mem.resp.valid) {
-        tibVAddr := Cat(statusWord(63, 32), 0.U(32.W))
-        state := loadNumRefs
-      }
-    }
-    is(loadNumRefs) {
-      tlb.io.req.valid := true.B
-      tlb.io.req.bits.vaddr := tibVAddr
-      when(tlb.io.resp.valid) {
-        val tibPAddr = tlb.io.resp.bits.paddr
-        io.mem.req.valid := true.B
-        io.mem.req.bits.addr := tibPAddr
-        io.mem.req.bits.cmd := M_XRD
-        when(io.mem.resp.valid) {
-          numRefs := io.mem.resp.bits.data
-          refCounter := 0.U
-          refOffsetsAddr := tibPAddr + 8.U
-          state := processRefs
+      // TRANSLATE_ADDR state: Translate object virtual address to physical address
+      tlb.io.req.valid := true.B              // Send request to TLB
+      tlb.io.req.bits.vaddr := objVAddr       // Set virtual address to be translated
+      when(tlb.io.req.ready) {                // Wait until TLB is ready to accept request
+        when(tlb.io.resp.valid) {             // Wait for valid TLB response
+        tlb.io.req.valid := false.B
+          objPAddr := tlb.io.resp.bits.paddr  // Save translated physical address
+          state := loadStatusWord             // Move to next state to load status word
         }
       }
     }
+
+    is(loadStatusWord) {
+      // LOAD_STATUS_WORD state: Load status word from the physical address
+      io.mem.req.valid := true.B              // Set memory request as valid
+      io.mem.req.bits.addr := objPAddr        // Use object physical address
+      io.mem.req.bits.cmd := M_XRD            // Read command
+      when(io.mem.req.ready) {                // Wait until memory is ready to accept request
+        when(io.mem.resp.valid) {             // Wait for memory response
+        io.mem.req.valid := false.B
+          statusWord := io.mem.resp.bits.data // Store retrieved status word
+          state := setMarkBit                 // Move to set mark bit state
+        }
+      }
+    }
+
+    is(setMarkBit) {
+      // SET_MARK_BIT state: Set the mark bit in the status word and write back
+      statusWord := statusWord | 1.U          // Set the mark bit (LSB) to 1
+      io.mem.req.valid := true.B              // Memory request active
+      io.mem.req.bits.addr := objPAddr        // Address to write back status word
+      io.mem.req.bits.cmd := M_XWR            // Write command
+      io.mem.req.bits.data := statusWord      // Data to write (updated status word)
+      when(io.mem.req.ready) {                // Wait for memory readiness
+        when(io.mem.resp.valid) {             // Confirm write response
+        io.mem.req.valid := false.B
+          tibVAddr := Cat(statusWord(63, 32), 0.U(32.W)) // Get TIB virtual address from statusWord
+          state := loadNumRefs                // Move to state to load number of references
+        }
+      }
+    }
+
+    is(loadNumRefs) {
+      // LOAD_NUM_REFS state: Translate TIB virtual address and load number of references
+      tlb.io.req.valid := true.B              // Request translation for TIB virtual address
+      tlb.io.req.bits.vaddr := tibVAddr       // Set TIB virtual address
+      when(tlb.io.req.ready) {                // Wait for TLB readiness
+        when(tlb.io.resp.valid) {      
+          tlb.io.req.valid := false.B       // Wait for valid TLB response
+          val tibPAddr = tlb.io.resp.bits.paddr // Get physical address for TIB
+          io.mem.req.valid := true.B          // Memory request active
+          io.mem.req.bits.addr := tibPAddr    // Use TIB physical address for memory access
+          io.mem.req.bits.cmd := M_XRD        // Read command to retrieve number of references
+          when(io.mem.req.ready) {            // Wait for memory readiness
+            when(io.mem.resp.valid) {         // Confirm memory response
+            io.mem.req.valid := false.B
+              numRefs := io.mem.resp.bits.data // Store number of references
+              refCounter := 0.U               // Initialize reference counter
+              refOffsetsAddr := tibPAddr + 8.U // Set address of first reference offset
+              state := processRefs            // Move to process references state
+            }
+          }
+        }
+      }
+    }
+
     is(processRefs) {
-      when(refCounter < numRefs) {
-        io.mem.req.valid := true.B
-        io.mem.req.bits.addr := refOffsetsAddr + (refCounter << 3)
-        io.mem.req.bits.cmd := M_XRD
-        when(io.mem.resp.valid) {
-          refAddr := io.mem.resp.bits.data + objPAddr
-          refCounter := refCounter + 1.U
-          state := outputRef
+      io.outputRefReady := false.B
+      // PROCESS_REFS state: Load each reference offset and compute reference address
+      when(refCounter < numRefs) {            // Continue if there are more references
+        io.mem.req.valid := true.B            // Set memory request as valid
+        io.mem.req.bits.addr := refOffsetsAddr + (refCounter << 3) // Address of current reference offset
+        io.mem.req.bits.cmd := M_XRD          // Read command
+        when(io.mem.req.ready) {              // Wait for memory readiness
+          when(io.mem.resp.valid) {           // Wait for valid response
+          io.mem.req.valid := false.B
+            refAddr := io.mem.resp.bits.data + objPAddr // Calculate reference address
+            refCounter := refCounter + 1.U    // Increment reference counter
+            state := outputRef                // Move to output reference state
+          }
         }
       } .otherwise {
+        // If all references processed, return to idle state
         state := idle
       }
     }
+
     is(outputRef) {
-      io.outputRefReady := true.B
-      when(io.outputRefReady) {
-        state := processRefs
+      // OUTPUT_REF state: Output the calculated reference address
+      io.outputRefReady := true.B             // Indicate reference address is ready
+      when(io.outputRefReady) {               // Wait for output acknowledgment
+        state := processRefs                  // Return to process next reference
+        
       }
     }
   }
